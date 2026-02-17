@@ -40,6 +40,7 @@ class LLMJepa(nn.Module):
         # Enable Gradient Checkpointing for memory savings
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
+            self.model.config.use_cache = False
 
         # Ensure pad token exists
         if self.tokenizer.pad_token is None:

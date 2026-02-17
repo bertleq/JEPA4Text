@@ -74,8 +74,8 @@ def load_paired_data(cfg: JEPAConfig) -> Tuple[List[str], List[str]]:
         path = cfg.dataset_files
         if path.endswith(".jsonl") or path.endswith(".json"):
             with open(path) as f:
-                for line in f:
-                    obj = json.loads(line)
+                objs = json.load(f)
+                for obj in objs:
                     texts.append(str(obj[cfg.text_field]))
                     codes.append(str(obj[cfg.code_field]))
         else:
@@ -223,15 +223,20 @@ def train(cfg: JEPAConfig) -> None:
             # Move to device
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
+            # ── Pass 1: Autoregressive NTP ─────────────────────────────
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                # ── Pass 1: Autoregressive NTP ─────────────────────────────
                 ntp_loss, _ = llm_jepa.forward_autoregressive(
                     input_ids=batch["ar_input_ids"],
                     attention_mask=batch["ar_attention_mask"],
                     labels=batch["ar_labels"],
                 )
+                scaled_ntp_loss = ntp_loss / cfg.gradient_accumulation_steps
+            
+            # Backward immediately to free graph
+            scaler.scale(scaled_ntp_loss).backward()
 
-                # ── Pass 2: Forward JEPA (Text -> Code) ────────────────────
+            # ── Pass 2: Forward JEPA (Text -> Code) ────────────────────
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 # Uses Main Model for Text(Pred) and Target Model for Code
                 pred_emb_fwd, target_emb_fwd = llm_jepa.forward_jepa_step(
                     pred_input_ids=batch["text_pred_input_ids"],
@@ -245,8 +250,14 @@ def train(cfg: JEPAConfig) -> None:
                     jepa_loss_fwd = info_nce_loss(pred_emb_fwd, target_emb_fwd, cfg.jepa_temperature)
                 else:
                     jepa_loss_fwd = cosine_distance(pred_emb_fwd, target_emb_fwd)
+                
+                scaled_jepa_fwd = jepa_loss_fwd * cfg.jepa_alpha / cfg.gradient_accumulation_steps
 
-                # ── Pass 3: Backward JEPA (Code -> Text) ───────────────────
+            # Backward immediately
+            scaler.scale(scaled_jepa_fwd).backward()
+
+            # ── Pass 3: Backward JEPA (Code -> Text) ───────────────────
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 pred_emb_bwd, target_emb_bwd = llm_jepa.forward_jepa_step(
                     pred_input_ids=batch["code_pred_input_ids"],
                     pred_attention_mask=batch["code_pred_attention_mask"],
@@ -259,19 +270,16 @@ def train(cfg: JEPAConfig) -> None:
                     jepa_loss_bwd = info_nce_loss(pred_emb_bwd, target_emb_bwd, cfg.jepa_temperature)
                 else:
                     jepa_loss_bwd = cosine_distance(pred_emb_bwd, target_emb_bwd)
+                
+                scaled_jepa_bwd = jepa_loss_bwd * cfg.jepa_beta / cfg.gradient_accumulation_steps
 
-                # ── Combined loss ──────────────────────────────────────────
-                loss = compute_combined_loss(
-                    ntp_loss, 
-                    jepa_loss_fwd, 
-                    jepa_loss_bwd, 
-                    cfg.jepa_alpha, 
-                    cfg.jepa_beta
-                )
-                loss = loss / cfg.gradient_accumulation_steps
-            
-            # Scaled backward
-            scaler.scale(loss).backward()
+            # Backward immediately
+            scaler.scale(scaled_jepa_bwd).backward()
+
+            # Calculate total loss for logging (detached)
+            loss = ntp_loss.detach() + \
+                   cfg.jepa_alpha * jepa_loss_fwd.detach() + \
+                   cfg.jepa_beta * jepa_loss_bwd.detach()
 
             if step % cfg.gradient_accumulation_steps == 0:
                 # Unscale before clipping
