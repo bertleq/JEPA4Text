@@ -56,6 +56,7 @@ class JEPAConfig:
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.05
     max_steps: int = -1  # -1 means train for full epochs
+    max_grad_norm: float = 1.0  # Gradient clipping threshold
     seed: int = 42
     fp16: bool = False
     bf16: bool = True

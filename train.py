@@ -205,6 +205,11 @@ def train(cfg: JEPAConfig) -> None:
 
     from loss import info_nce_loss, cosine_distance
 
+    # Mixed Precision Setup
+    use_amp = cfg.fp16 or cfg.bf16
+    amp_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
+
     for epoch in range(1, cfg.epochs + 1):
         # Accumulate as tensors to avoid CPU sync every step
         epoch_ntp_loss = torch.tensor(0.0, device=device)
@@ -217,55 +222,67 @@ def train(cfg: JEPAConfig) -> None:
             # Move to device
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            # ── Pass 1: Autoregressive NTP ─────────────────────────────
-            ntp_loss, _ = llm_jepa.forward_autoregressive(
-                input_ids=batch["ar_input_ids"],
-                attention_mask=batch["ar_attention_mask"],
-                labels=batch["ar_labels"],
-            )
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                # ── Pass 1: Autoregressive NTP ─────────────────────────────
+                ntp_loss, _ = llm_jepa.forward_autoregressive(
+                    input_ids=batch["ar_input_ids"],
+                    attention_mask=batch["ar_attention_mask"],
+                    labels=batch["ar_labels"],
+                )
 
-            # ── Pass 2: Forward JEPA (Text -> Code) ────────────────────
-            # Uses Main Model for Text(Pred) and Target Model for Code
-            pred_emb_fwd, target_emb_fwd = llm_jepa.forward_jepa_step(
-                pred_input_ids=batch["text_pred_input_ids"],
-                pred_attention_mask=batch["text_pred_attention_mask"],
-                target_encoder=target_llm_jepa,
-                target_input_ids=batch["code_target_input_ids"],
-                target_attention_mask=batch["code_target_attention_mask"],
-            )
+                # ── Pass 2: Forward JEPA (Text -> Code) ────────────────────
+                # Uses Main Model for Text(Pred) and Target Model for Code
+                pred_emb_fwd, target_emb_fwd = llm_jepa.forward_jepa_step(
+                    pred_input_ids=batch["text_pred_input_ids"],
+                    pred_attention_mask=batch["text_pred_attention_mask"],
+                    target_encoder=target_llm_jepa,
+                    target_input_ids=batch["code_target_input_ids"],
+                    target_attention_mask=batch["code_target_attention_mask"],
+                )
+                
+                if cfg.jepa_loss_type == "infonce":
+                    jepa_loss_fwd = info_nce_loss(pred_emb_fwd, target_emb_fwd, cfg.jepa_temperature)
+                else:
+                    jepa_loss_fwd = cosine_distance(pred_emb_fwd, target_emb_fwd)
+
+                # ── Pass 3: Backward JEPA (Code -> Text) ───────────────────
+                pred_emb_bwd, target_emb_bwd = llm_jepa.forward_jepa_step(
+                    pred_input_ids=batch["code_pred_input_ids"],
+                    pred_attention_mask=batch["code_pred_attention_mask"],
+                    target_encoder=target_llm_jepa,
+                    target_input_ids=batch["text_target_input_ids"],
+                    target_attention_mask=batch["text_target_attention_mask"],
+                )
+                
+                if cfg.jepa_loss_type == "infonce":
+                    jepa_loss_bwd = info_nce_loss(pred_emb_bwd, target_emb_bwd, cfg.jepa_temperature)
+                else:
+                    jepa_loss_bwd = cosine_distance(pred_emb_bwd, target_emb_bwd)
+
+                # ── Combined loss ──────────────────────────────────────────
+                loss = compute_combined_loss(
+                    ntp_loss, 
+                    jepa_loss_fwd, 
+                    jepa_loss_bwd, 
+                    cfg.jepa_alpha, 
+                    cfg.jepa_beta
+                )
+                loss = loss / cfg.gradient_accumulation_steps
             
-            if cfg.jepa_loss_type == "infonce":
-                jepa_loss_fwd = info_nce_loss(pred_emb_fwd, target_emb_fwd, cfg.jepa_temperature)
-            else:
-                jepa_loss_fwd = cosine_distance(pred_emb_fwd, target_emb_fwd)
-
-            # ── Pass 3: Backward JEPA (Code -> Text) ───────────────────
-            pred_emb_bwd, target_emb_bwd = llm_jepa.forward_jepa_step(
-                pred_input_ids=batch["code_pred_input_ids"],
-                pred_attention_mask=batch["code_pred_attention_mask"],
-                target_encoder=target_llm_jepa,
-                target_input_ids=batch["text_target_input_ids"],
-                target_attention_mask=batch["text_target_attention_mask"],
-            )
-            
-            if cfg.jepa_loss_type == "infonce":
-                jepa_loss_bwd = info_nce_loss(pred_emb_bwd, target_emb_bwd, cfg.jepa_temperature)
-            else:
-                jepa_loss_bwd = cosine_distance(pred_emb_bwd, target_emb_bwd)
-
-            # ── Combined loss ──────────────────────────────────────────
-            loss = compute_combined_loss(
-                ntp_loss, 
-                jepa_loss_fwd, 
-                jepa_loss_bwd, 
-                cfg.jepa_alpha, 
-                cfg.jepa_beta
-            )
-            loss = loss / cfg.gradient_accumulation_steps
-            loss.backward()
+            # Scaled backward
+            scaler.scale(loss).backward()
 
             if step % cfg.gradient_accumulation_steps == 0:
-                optimizer.step()
+                # Unscale before clipping
+                scaler.unscale_(optimizer)
+                
+                # Gradient Clipping
+                if cfg.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(llm_jepa.parameters(), cfg.max_grad_norm)
+                
+                # Scaler step
+                scaler.step(optimizer)
+                scaler.update()
                 
                 # Update EMA Target
                 if cfg.use_ema_target:
