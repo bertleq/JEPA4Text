@@ -31,7 +31,10 @@ class LLMJepa(nn.Module):
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             trust_remote_code=True,
-            torch_dtype=torch.bfloat16 if config.bf16 else (torch.float16 if config.fp16 else torch.float32),
+            # For BFloat16, weights can be BF16.
+            # For FP16 (AMP), weights must be FP32 to support GradScaler/Optimizer stability,
+            # unless using specialized optimizers. Autocast handles the op precision.
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         )
 
         # Ensure pad token exists

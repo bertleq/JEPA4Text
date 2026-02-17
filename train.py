@@ -208,7 +208,8 @@ def train(cfg: JEPAConfig) -> None:
     # Mixed Precision Setup
     use_amp = cfg.fp16 or cfg.bf16
     amp_dtype = torch.bfloat16 if cfg.bf16 else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.fp16)
+    # Use generic torch.amp.GradScaler for newer PyTorch versions
+    scaler = torch.amp.GradScaler("cuda", enabled=cfg.fp16)
 
     for epoch in range(1, cfg.epochs + 1):
         # Accumulate as tensors to avoid CPU sync every step
@@ -222,7 +223,7 @@ def train(cfg: JEPAConfig) -> None:
             # Move to device
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 # ── Pass 1: Autoregressive NTP ─────────────────────────────
                 ntp_loss, _ = llm_jepa.forward_autoregressive(
                     input_ids=batch["ar_input_ids"],
