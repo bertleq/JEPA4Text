@@ -37,6 +37,10 @@ class LLMJepa(nn.Module):
             torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         )
 
+        # Enable Gradient Checkpointing for memory savings
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+
         # Ensure pad token exists
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

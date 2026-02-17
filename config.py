@@ -10,13 +10,13 @@ class JEPAConfig:
     """All hyperparameters for LLM-JEPA training."""
 
     # ── Model ──────────────────────────────────────────────────────────
-    model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
 
     # ── Dataset ────────────────────────────────────────────────────────
     dataset_path: str = "json"  # HF dataset id or loader ("json", "csv")
-    dataset_files: Optional[str] = None  # path to local file(s) if loader
-    text_field: str = "text"  # column name for the "text" view
-    code_field: str = "code"  # column name for the "code" view
+    dataset_files: Optional[str] = "data/dataset.json"  # path to local file(s) if loader
+    text_field: str = "prompt"  # column name for the "text" view
+    code_field: str = "completion"  # column name for the "code" view
 
     # ── JEPA-specific ──────────────────────────────────────────────────
     lambda_jepa: float = 1.0  # (Legacy) or total weight
@@ -58,8 +58,9 @@ class JEPAConfig:
     max_steps: int = -1  # -1 means train for full epochs
     max_grad_norm: float = 1.0  # Gradient clipping threshold
     seed: int = 42
-    fp16: bool = False
-    bf16: bool = True
+    fp16: bool = True
+    bf16: bool = False
+    gradient_checkpointing: bool = False
 
     # ── LoRA (optional) ────────────────────────────────────────────────
     use_lora: bool = False
