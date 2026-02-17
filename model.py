@@ -72,6 +72,8 @@ class LLMJepa(nn.Module):
             nn.Linear(config.projection_dim, config.projection_dim),
             nn.LayerNorm(config.projection_dim),
         )
+        # Match dtype of the base model
+        self.projection_head.to(self.model.dtype)
 
     # ── Autoregressive NTP pass ────────────────────────────────────────
 
