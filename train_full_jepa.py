@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 
 from config import JEPAConfig
 from dataset import JEPADataset, jepa_collate_fn
-from loss import compute_combined_loss
+from loss import compute_combined_loss, prototype_nce_loss
 from model import LLMJepa
 
 logging.basicConfig(
@@ -138,6 +138,7 @@ def train(cfg: JEPAConfig) -> None:
     target_llm_jepa.model.to(device)
     target_llm_jepa.projection_head.to(device)
 
+
     # ── Dataset & DataLoader ───────────────────────────────────────────
     texts, codes = load_paired_data(cfg)
     dataset = JEPADataset(
@@ -212,10 +213,12 @@ def train(cfg: JEPAConfig) -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=cfg.fp16)
 
     for epoch in range(1, cfg.epochs + 1):
+        with torch.no_grad():
+            proto = llm_jepa.proto_ema.detach()
         # Accumulate as tensors to avoid CPU sync every step
         epoch_ntp_loss = torch.tensor(0.0, device=device)
         epoch_jepa_fwd = torch.tensor(0.0, device=device)
-        epoch_jepa_bwd = torch.tensor(0.0, device=device)
+        epoch_jepa_proto = torch.tensor(0.0, device=device)
         epoch_total_loss = torch.tensor(0.0, device=device)
         num_batches = 0
 
@@ -238,7 +241,7 @@ def train(cfg: JEPAConfig) -> None:
             # ── Pass 2: Forward JEPA (Text -> Code) ────────────────────
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 # Uses Main Model for Text(Pred) and Target Model for Code
-                pred_emb_fwd, target_emb_fwd = llm_jepa.forward_jepa_step(
+                pred_emb_fwd, target_emb_fwd, pred_raw, future_token_ids = llm_jepa.fully_forward_jepa_step(
                     pred_input_ids=batch["text_pred_input_ids"],
                     pred_attention_mask=batch["text_pred_attention_mask"],
                     target_encoder=target_llm_jepa,
@@ -253,39 +256,25 @@ def train(cfg: JEPAConfig) -> None:
                     with torch.autocast("cuda", enabled=False):
                         jepa_loss_fwd = cosine_distance(pred_emb_fwd, target_emb_fwd)
                 
-                scaled_jepa_fwd = jepa_loss_fwd * cfg.jepa_alpha / cfg.gradient_accumulation_steps
-
-            # Backward immediately
-            scaler.scale(scaled_jepa_fwd).backward()
-
-            # ── Pass 3: Backward JEPA (Code -> Text) ───────────────────
-            """
-            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                pred_emb_bwd, target_emb_bwd = llm_jepa.forward_jepa_step(
-                    pred_input_ids=batch["code_pred_input_ids"],
-                    pred_attention_mask=batch["code_pred_attention_mask"],
-                    target_encoder=target_llm_jepa,
-                    target_input_ids=batch["text_target_input_ids"],
-                    target_attention_mask=batch["text_target_attention_mask"],
+            with torch.autocast("cuda", enabled=False):
+                proto = proto.to(future_token_ids.device)
+                proto_l = prototype_nce_loss(
+                    pred_raw,
+                    future_token_ids,
+                    proto
                 )
-                
-                if cfg.jepa_loss_type == "infonce":
-                    with torch.autocast("cuda", enabled=False):
-                        jepa_loss_bwd = info_nce_loss(pred_emb_bwd, target_emb_bwd, cfg.jepa_temperature)
-                else:
-                    with torch.autocast("cuda", enabled=False):
-                        jepa_loss_bwd = cosine_distance(pred_emb_bwd, target_emb_bwd)
-                
-                scaled_jepa_bwd = jepa_loss_bwd * cfg.jepa_beta / cfg.gradient_accumulation_steps
-
-            # Backward immediately
-            scaler.scale(scaled_jepa_bwd).backward()"""
-
+            scaled_jepa_fwd = (
+                    jepa_loss_fwd * cfg.jepa_alpha
+                    + proto_l * cfg.jepa_beta        # <-- important
+                ) / cfg.gradient_accumulation_steps
+            scaler.scale(scaled_jepa_fwd).backward()
+            
             # Calculate total loss for logging (detached)
-            loss = ntp_loss.detach() + \
-                   cfg.jepa_alpha * jepa_loss_fwd.detach() #+ \
-                   #cfg.jepa_beta * jepa_loss_bwd.detach()
-
+            loss = (
+                ntp_loss.detach()
+                + cfg.jepa_alpha * jepa_loss_fwd.detach()
+                + cfg.jepa_beta * proto_l.detach()
+            )
             if step % cfg.gradient_accumulation_steps == 0:
                 # Unscale before clipping
                 scaler.unscale_(optimizer)
@@ -308,12 +297,13 @@ def train(cfg: JEPAConfig) -> None:
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+                llm_jepa.update_proto_ema()
 
             # ── Logging ────────────────────────────────────────────────
             # Detach to avoid graph retention, but keep on device to avoid sync
             epoch_ntp_loss += ntp_loss.detach()
             epoch_jepa_fwd += jepa_loss_fwd.detach()
-            #epoch_jepa_bwd += jepa_loss_bwd.detach()
+            epoch_jepa_proto += proto_l.detach()
             epoch_total_loss += loss.detach() * cfg.gradient_accumulation_steps
             num_batches += 1
 
@@ -321,13 +311,13 @@ def train(cfg: JEPAConfig) -> None:
                 # Sync only when logging
                 avg_ntp = epoch_ntp_loss.item() / num_batches
                 avg_fwd = epoch_jepa_fwd.item() / num_batches
-                #avg_bwd = epoch_jepa_bwd.item() / num_batches
+                avg_proto = epoch_jepa_proto.item() / num_batches
                 avg_total = epoch_total_loss.item() / num_batches
                 lr_now = scheduler.get_last_lr()[0]
                 logger.info(
                     f"Ep {epoch}/{cfg.epochs} St {step} "
                     f"L={avg_total:.3f} NTP={avg_ntp:.3f} "
-                    f"Fwd={avg_fwd:.3f}"# Bwd={avg_bwd:.3f} "
+                    f"Fwd={avg_fwd:.3f} Proto={avg_proto:.3f} "
                     f"lr={lr_now:.2e}"
                 )
                 if cfg.use_wandb:
@@ -338,7 +328,7 @@ def train(cfg: JEPAConfig) -> None:
                             "loss/total": avg_total,
                             "loss/ntp": avg_ntp,
                             "loss/jepa_fwd": avg_fwd,
-                            #"loss/jepa_bwd": avg_bwd,
+                            "loss/jepa_proto": avg_proto,
                             "lr": lr_now,
                             "epoch": epoch,
                             "global_step": global_step,
@@ -353,16 +343,16 @@ def train(cfg: JEPAConfig) -> None:
         # ── End of epoch ───────────────────────────────────────────────
         avg_ntp = epoch_ntp_loss.item() / max(num_batches, 1)
         avg_fwd = epoch_jepa_fwd.item() / max(num_batches, 1)
-        #avg_bwd = epoch_jepa_bwd.item() / max(num_batches, 1)
+        avg_proto = epoch_jepa_proto.item() / max(num_batches, 1)
         avg_total = epoch_total_loss.item() / max(num_batches, 1)
         logger.info(
             f"Epoch {epoch} done — "
-            f"L={avg_total:.3f} NTP={avg_ntp:.3f} Fwd={avg_fwd:.3f}"# Bwd={avg_bwd:.3f}"
+            f"L={avg_total:.3f} NTP={avg_ntp:.3f} Fwd={avg_fwd:.3f} Proto={avg_proto:.3f}"
         )
 
         if cfg.save_every_epoch:
             ckpt_dir = os.path.join(cfg.output_dir, f"epoch_{epoch}")
-            llm_jepa.model.save_pretrained(ckpt_dir)
+            llm_jepa.save_jepa(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
             logger.info(f"Checkpoint saved → {ckpt_dir}")
 

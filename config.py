@@ -24,13 +24,13 @@ class JEPAConfig:
     pred_token_str: str = "[PRED]"  # surface form of the predictor token
     
     # New enhancements
-    jepa_loss_type: str = "infonce"  # "cosine" or "infonce"
-    jepa_temperature: float = 0.07   # τ for InfoNCE
+    jepa_loss_type: str = "cosine"  # "cosine" or "infonce"
+    jepa_temperature: float = 0.5   # τ for InfoNCE
     
     # Joint Optimization (Bidirectional)
     # L = L_LLM + alpha * L(Text->Code) + beta * L(Code->Text)
-    jepa_alpha: float = 1.0
-    jepa_beta: float = 1.0
+    jepa_alpha: float = 0.02
+    jepa_beta: float = 0.02
     
     # Architecture
     projection_dim: int = 256  # Dimensionality of the projection head
@@ -39,20 +39,21 @@ class JEPAConfig:
     # EMA Target
     use_ema_target: bool = True
     ema_decay: float = 0.99
+    proto_ema_tau: float = 0.99
     
     # Masking
-    mask_ratio: float = 0.15   # Ratio of tokens to mask in the input view
+    mask_ratio: float = 0.10   # Ratio of tokens to mask in the input view
 
     # ── Sequence lengths ───────────────────────────────────────────────
     max_seq_len: int = 512  # max tokens for the autoregressive pass
-    max_text_len: int = 256  # max tokens for the text-only encoder pass
-    max_code_len: int = 256  # max tokens for the code-only encoder pass
+    max_text_len: int = 512  # max tokens for the text-only encoder pass
+    max_code_len: int = 512  # max tokens for the code-only encoder pass
 
     # ── Training ───────────────────────────────────────────────────────
-    lr: float = 2e-5
+    lr: float = 1e-5#8e-6
     weight_decay: float = 0.01
-    epochs: int = 4
-    batch_size: int = 4
+    epochs: int = 7
+    batch_size: int = 2
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.05
     max_steps: int = -1  # -1 means train for full epochs
@@ -64,15 +65,15 @@ class JEPAConfig:
 
     # ── LoRA (optional) ────────────────────────────────────────────────
     use_lora: bool = False
-    lora_rank: int = 64
-    lora_alpha: int = 128
+    lora_rank: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
     lora_target_modules: list = field(
         default_factory=lambda: ["q_proj", "v_proj", "k_proj", "o_proj"]
     )
 
     # ── Logging / checkpointing ────────────────────────────────────────
-    output_dir: str = "./checkpoints"
+    output_dir: str = "./checkpoints_energy"
     log_every: int = 10
     save_every_epoch: bool = True
     use_wandb: bool = False

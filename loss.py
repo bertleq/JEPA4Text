@@ -40,13 +40,37 @@ def info_nce_loss(
     # Cosine similarity matrix: (B, B)
     # logits[i, j] = sim(query[i], key[j]) / temp
     logits = torch.matmul(query_emb, key_emb.t()) / temperature
-    
+    logits = logits - logits.max(dim=1, keepdim=True)[0]
     # Labels are [0, 1, ..., B-1] (diagonal elements are positives)
     labels = torch.arange(logits.size(0), device=logits.device)
     
     return F.cross_entropy(logits, labels)
 
 
+
+def prototype_nce_loss(pred, target_token_ids, proto_matrix, temp=0.07):
+
+    pred = F.normalize(pred, dim=-1)
+
+    proto = proto_matrix.to(
+        device=pred.device,
+        dtype=pred.dtype
+    )
+
+    logits = pred @ proto.T / temp   # [B, V]
+
+    return F.cross_entropy(logits, target_token_ids)
+    
+def prototype_loss(pred, target_token_ids, proto_matrix):
+    """
+    pred: [B, D]  (predictor output)
+    target_token_ids: [B]  token t_{k+Δ}
+    proto_matrix: [V, D]   normalized lm_head.weight
+    """
+    pred = F.normalize(pred, dim=-1)
+    tgt  = proto_matrix[target_token_ids]
+    return 1 - (pred * tgt).sum(-1).mean()
+    
 def compute_combined_loss(
     ntp_loss: torch.Tensor,
     jepa_loss_fwd: torch.Tensor,
