@@ -1,0 +1,61 @@
+# configs/qwen25_0.5b.yaml
+# Quick-start: Qwen2.5-0.5B on a single GPU (or CPU for debugging).
+# Effective batch = 2 * 4 = 8 sequences.
+#
+# Usage (all flags can also be passed directly on the CLI):
+#   python train.py --train_file data/train.jsonl \
+#       $(python -c "
+#   import yaml, sys
+#   cfg = yaml.safe_load(open('configs/qwen25_0.5b.yaml'))
+#   print(' '.join(f'--{k} {v}' for k,v in cfg.items() if not str(v).startswith('#')))
+#   ")
+
+model_name_or_path: Qwen/Qwen2.5-0.5B
+torch_dtype: bfloat16
+max_seq_len: 2048
+
+# LoRA — full Qwen2.5 attention + FFN coverage
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# JEPA features
+use_pred_token: true
+use_offset_head: true
+use_infonce: true
+
+# Offset head mode — "both" runs pred_token MLP + mlp_head MLP simultaneously
+offset_head_mode: both
+pred_interval: 4            # insert [PRED] every 4 real tokens
+
+# Loss weights (lm_loss is the anchor, JEPA losses are auxiliary)
+lm_loss_weight: 1.0
+jepa_pred_token_weight: 0.5   # raw [PRED] cosine loss
+jepa_offset_head_weight: 0.5  # mlp_head: h_t -> h_{t+1}
+jepa_pred_head_weight: 0.5    # pred_token head: h[PRED] -> h[preceding]
+infonce_weight: 0.3
+infonce_temperature: 0.07
+
+# Head architecture (both heads share these settings)
+offset_head_hidden_dim: 512
+offset_head_num_layers: 2
+
+# Training
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4    # effective batch = 8
+num_train_epochs: 3
+learning_rate: 2e-4
+offset_head_lr_multiplier: 5.0    # heads train at 1e-3
+weight_decay: 0.01
+warmup_ratio: 0.05
+logging_steps: 50
+save_steps: 500
+output_dir: ./checkpoints/qwen25-0.5b-jepa

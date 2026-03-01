@@ -1,0 +1,48 @@
+# configs/qwen25_7b.yaml
+# Production recipe: Qwen2.5-7B on 4× A100 (or 2× A100-80GB).
+# Effective batch = 2 * 8 * (num_gpus) sequences.
+# For multi-GPU, wrap with: torchrun --nproc_per_node=4 train.py ...
+# (basic DDP works; for FSDP/DeepSpeed, add your own launcher wrapper)
+
+model_name_or_path: Qwen/Qwen2.5-7B
+torch_dtype: bfloat16
+max_seq_len: 2048
+
+lora_r: 64
+lora_alpha: 128
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+use_pred_token: true
+use_offset_head: true
+use_infonce: true
+offset_head_mode: both
+pred_interval: 8            # sparser [PRED] for longer sequences
+
+lm_loss_weight: 1.0
+jepa_pred_token_weight: 0.4
+jepa_offset_head_weight: 0.4
+jepa_pred_head_weight: 0.4
+infonce_weight: 0.2         # lower weight: 7B hidden dim -> huge N -> saturates fast
+infonce_temperature: 0.07
+
+offset_head_hidden_dim: 1024
+offset_head_num_layers: 3
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
+num_train_epochs: 3
+learning_rate: 1e-4
+offset_head_lr_multiplier: 5.0
+weight_decay: 0.01
+warmup_ratio: 0.05
+logging_steps: 50
+save_steps: 250
+output_dir: ./checkpoints/qwen25-7b-jepa
